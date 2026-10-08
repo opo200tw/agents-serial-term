@@ -209,12 +209,12 @@ serial-term: /dev/cu.usbmodem1101 @ 115200  mode=mixed  tx-eol=lf  (/help for cm
 PING
 > PING<LF>
 < 00000000  48 52 53 50 00 00 00 00  00 00 00 00 00 00 00 00  |HRSP............|
-< 00000010  04 00 00 00 50 4f 4e 47  00 00 00 00              |....PONG....|
+< 00000010  04 00 00 00 50 4f 4e 47  78 a6 39 e9              |....PONGx.9.|
 /a
 --- mode=ascii ---
 VERSION
 > VERSION<LF>
-< HRSP\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x15\x00\x00\x00usbd_cdc_demo v0.2\x00\x00\x00\x00
+< HRSP\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x0e\x00\x00\x00htpa_cdc 0.3.0\x80\xecfv
 /quit
 ```
 
@@ -267,7 +267,7 @@ Sample `.txt` content:
 ```
 2026-04-24 12:28:38.474 --- session start: /dev/cu.usbmodem1101 @ 115200, mode=mixed, tx-eol=lf ---
 2026-04-24 12:28:38.486 < 00000000  48 52 53 50 14 00 00 00  00 00 00 00 00 00 00 00  |HRSP............|
-2026-04-24 12:28:38.491 < 00000010  04 00 00 00 50 4f 4e 47  00 00 00 00              |....PONG....|
+2026-04-24 12:28:38.491 < 00000010  04 00 00 00 50 4f 4e 47  04 e6 12 47              |....PONG...G|
 ```
 
 ## Why not `screen` / `minicom`?
