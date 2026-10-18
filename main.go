@@ -868,7 +868,12 @@ func main() {
 		go readerLoop(p, logF, st, func(e error) {
 			fmt.Fprintf(os.Stderr, "[reader] %v\n", e)
 		}, stop, done)
-		h.run()
+		// The stdin loop runs off the main goroutine: a FIFO opened
+		// read-write (`0<>fifo`) never reaches EOF, so a Scan() blocked on it
+		// must not keep SIGTERM/SIGINT from reaching the shutdown below. Both
+		// the signal handler and /quit close stop; stdin EOF does not.
+		go h.run()
+		<-stop
 	}
 
 	safeClose(stop)
