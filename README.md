@@ -151,6 +151,7 @@ EOF
 - **Local commands** start with `/` so device traffic and tool commands never collide.
 - `--log FILE` byte-perfect raw RX capture (binary), independent of display mode.
 - `--text-log FILE` mirrors the rendered display to a text file, with full date+time stamp on every line. Writes go through the OS page cache — `tail -f` sees them immediately — but `fsync` only happens on clean shutdown (too expensive per-line at 300 KB/s). A crash can lose up to a few seconds of trailing log.
+- **Reopen on port loss (headless only)**. When the USB-UART goes away mid-run (read error, EOF, or a TX write failing with `device not configured` / EIO), the tool writes `--- port lost: <err>, reopening <PORT> ---` to stdout and `--text-log`, closes the dead fd and retries opening the same path with the same baud every 500 ms for up to `--reopen-timeout` (default 30s). On success it writes `--- port reopened: <PORT> ---` and keeps logging; on give-up it writes `--- port lost, reopen failed after <d>: <err>; exiting ---`, syncs both logs and exits with status 3. `--reopen-timeout 0` skips the retries and exits 3 on the first loss. SIGINT / SIGTERM / `/quit` still end the process promptly during a reopen wait (status 0). The TUI does not reopen: it reports the reader error in the sys pane as before.
 - `--ts` adds short `HH:MM:SS.mmm ` prefix to **stdout** (text-log always carries the full date regardless).
 - Port picker when PORT is omitted: 0 ports → error; 1 port → auto-select; multiple ports → numbered list + stdin prompt. `--list-ports` just prints the list and exits (good for scripting). macOS `/dev/tty.<X>` duplicates of `/dev/cu.<X>` are filtered out automatically.
 - Cross-platform (linux / darwin / windows × amd64 / arm64) via `go.bug.st/serial`.
@@ -177,6 +178,14 @@ flags:
                   (text, ideal for tail -f / grep / archival)
   --ts            start stdout with HH:MM:SS.mmm prefix on each line
   --tx-eol E      append to each TX line: none | cr | lf | crlf (default lf)
+  --reopen-timeout D
+                  headless only: when the port goes away, retry opening it
+                  every 500ms for up to D (default 30s, 0 = do not reopen)
+
+exit status:
+  0  normal shutdown (/quit, SIGINT, SIGTERM)
+  2  bad flags, or the port / a log file could not be opened at start
+  3  headless: the port was lost and could not be reopened in time
 
 interactive commands on stdin (type then Enter):
   /hex | /h              switch display to hex
@@ -261,6 +270,8 @@ serial-term --text-log /var/log/serial-$(date +%Y%m%d).txt "$PORT" < /dev/null
 ```
 
 `< /dev/null` closes stdin so the tool stops watching for `/commands` and just sits as a passive RX listener. `tail -f` sees new lines immediately (page cache). A crash may lose the last few seconds of buffered writes; clean shutdown via Ctrl-C / SIGTERM `fsync`s the file and writes the session-end summary.
+
+If the adapter drops off USB mid-capture, the log gets a `port lost` line and, once the port is back, a `port reopened` line; data resumes after it. A capture that stays down longer than `--reopen-timeout` ends with a `reopen failed` line and exit status 3, so a supervising script can tell it from a normal stop and restart it.
 
 Sample `.txt` content:
 
