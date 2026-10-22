@@ -503,11 +503,216 @@ func readerLoop(p serial.Port, logF io.Writer, st *state, errSink func(error), s
 	}
 }
 
+// openPort is serial.Open behind a package var so tests can stand in a fake
+// port for the open and every reopen.
+var openPort = func(path string, mode *serial.Mode) (serial.Port, error) {
+	return serial.Open(path, mode)
+}
+
+// portReadTimeout bounds each Read so readerLoop can notice stop.
+const portReadTimeout = 250 * time.Millisecond
+
+// reopenRetryInterval is the gap between reopen attempts. A var so tests do
+// not have to wait real seconds for a give-up.
+var reopenRetryInterval = 500 * time.Millisecond
+
+// exitPortLost is the exit code when the port went away and could not be
+// reopened within --reopen-timeout. Scripts tell it from a clean stop (0)
+// and from a startup error (2).
+const exitPortLost = 3
+
+// errStopped means a reopen wait ended because of SIGINT/SIGTERM or /quit.
+var errStopped = errors.New("stopped")
+
+// portEvent writes a port lifecycle marker. Any half-rendered RX line is
+// flushed first so the marker never gets glued to device output, and the
+// text log is synced: these lines exist for post-mortem, and they are rare
+// enough that the fsync costs nothing.
+func (s *state) portEvent(msg string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.flushPartialLocked()
+	s.writeSysLocked(msg)
+	if s.textLog != nil {
+		_ = s.textLog.Sync()
+	}
+}
+
+// runHeadless pumps RX from p until stop closes, and survives the USB-UART
+// going away (#1409). Before this, a dead port ended readerLoop while main
+// kept waiting on stop, so the process stayed alive with a dead fd and the
+// text log stopped without a word. Now any reader exit that is not a stop
+// is a loss: mark it in the log, close the port, reopen it with the same
+// mode for up to reopenTimeout, and carry on with a new reader.
+//
+// Returns 0 when stop closed, exitPortLost when the reopen gave up. The port
+// is closed and the reader has exited on return either way.
+func runHeadless(p serial.Port, path string, sm *serial.Mode, st *state, logW io.Writer, h *stdinHandler, stop chan struct{}, reopenTimeout time.Duration) int {
+	for {
+		done := make(chan struct{})
+		var mu sync.Mutex
+		var readErr error
+		go readerLoop(p, logW, st, func(e error) {
+			fmt.Fprintf(os.Stderr, "[reader] %v\n", e)
+			mu.Lock()
+			readErr = e
+			mu.Unlock()
+		}, stop, done)
+
+		select {
+		case <-stop:
+			_ = p.Close()
+			<-done
+			return 0
+		case <-done:
+		}
+		// readerLoop also returns on stop; that is a shutdown, not a loss.
+		select {
+		case <-stop:
+			_ = p.Close()
+			return 0
+		default:
+		}
+
+		// A tx-side loss closed the port to end the reader, so the read
+		// error is only "port closed"; the tx error is the real reason.
+		cause := h.takeTxLoss()
+		if cause == nil {
+			mu.Lock()
+			cause = readErr
+			mu.Unlock()
+		}
+		if cause == nil {
+			cause = io.EOF // readerLoop returns silently on EOF
+		}
+		st.portEvent(fmt.Sprintf("--- port lost: %v, reopening %s ---", cause, path))
+		_ = p.Close()
+
+		np, waited, err := reopenPort(path, sm, stop, reopenTimeout)
+		if errors.Is(err, errStopped) {
+			return 0
+		}
+		if err != nil {
+			st.portEvent(fmt.Sprintf("--- port lost, reopen failed after %v: %v; exiting ---", waited, err))
+			return exitPortLost
+		}
+		h.setPort(np)
+		st.portEvent(fmt.Sprintf("--- port reopened: %s ---", path))
+		p = np
+	}
+}
+
+// reopenPort retries openPort every reopenRetryInterval until it succeeds,
+// timeout has passed, or stop closes. It waits one interval before the
+// first attempt: a node that is just disappearing can still open, and an
+// immediate open-read-fail cycle would spin. timeout 0 means no attempt.
+func reopenPort(path string, sm *serial.Mode, stop <-chan struct{}, timeout time.Duration) (serial.Port, time.Duration, error) {
+	start := time.Now()
+	waited := func() time.Duration { return time.Since(start).Round(100 * time.Millisecond) }
+	if timeout <= 0 {
+		return nil, 0, errors.New("reopen disabled (--reopen-timeout 0)")
+	}
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	tick := time.NewTicker(reopenRetryInterval)
+	defer tick.Stop()
+	lastErr := errors.New("no reopen attempt finished")
+	for {
+		select {
+		case <-stop:
+			return nil, waited(), errStopped
+		case <-deadline.C:
+			return nil, waited(), lastErr
+		case <-tick.C:
+		}
+		np, err := openPort(path, sm)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		_ = np.SetReadTimeout(portReadTimeout)
+		return np, waited(), nil
+	}
+}
+
 type stdinHandler struct {
 	st    *state
-	port  serial.Port
 	txEOL []byte
 	stop  chan struct{}
+
+	// reopenOnLoss is true in headless mode, the only mode that reopens a
+	// lost port (runHeadless). Set before any goroutine reads it.
+	reopenOnLoss bool
+
+	// portMu guards port and txLossErr: headless mode swaps the port after a
+	// reopen while sendRaw and the bench TX goroutine keep writing to it.
+	portMu    sync.Mutex
+	port      serial.Port
+	txLossErr error // tx error that made us close port; read by the reopen path
+}
+
+// curPort returns the port TX must use right now.
+func (h *stdinHandler) curPort() serial.Port {
+	h.portMu.Lock()
+	defer h.portMu.Unlock()
+	return h.port
+}
+
+// setPort installs a freshly (re)opened port and forgets any loss reason
+// recorded against the previous one.
+func (h *stdinHandler) setPort(p serial.Port) {
+	h.portMu.Lock()
+	defer h.portMu.Unlock()
+	h.port = p
+	h.txLossErr = nil
+}
+
+// takeTxLoss returns and clears the tx error that closed the current port,
+// or nil if the port went away on the RX side.
+func (h *stdinHandler) takeTxLoss() error {
+	h.portMu.Lock()
+	defer h.portMu.Unlock()
+	err := h.txLossErr
+	h.txLossErr = nil
+	return err
+}
+
+// txPortGone handles a write that failed because the device is gone. It
+// does not reopen by itself: closing the port makes the reader exit, and the
+// reader exit is the one path that reopens, so a tx loss and an rx loss can
+// never run two reopens at once. A stale error from a port that was already
+// replaced is ignored. TUI mode has no reopen path (reopenOnLoss false), so
+// it keeps the old behaviour of logging the error and leaving the port open.
+func (h *stdinHandler) txPortGone(p serial.Port, err error) {
+	if !h.reopenOnLoss {
+		return
+	}
+	h.portMu.Lock()
+	if h.port != p {
+		h.portMu.Unlock()
+		return
+	}
+	if h.txLossErr == nil {
+		h.txLossErr = err
+	}
+	h.portMu.Unlock()
+	_ = p.Close()
+}
+
+// isPortGone reports whether err means the device node is dead (USB-UART
+// unplugged or re-enumerated) rather than a transient write failure. macOS
+// reports ENXIO ("device not configured"), Linux mostly EIO. The string
+// match covers errors that reach us without the errno in their chain.
+func isPortGone(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, syscall.ENXIO) || errors.Is(err, syscall.EIO) {
+		return true
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "device not configured") ||
+		strings.Contains(msg, "input/output error")
 }
 
 func (h *stdinHandler) run() {
@@ -616,12 +821,18 @@ func (h *stdinHandler) sendRaw(p, eol []byte) bool {
 	wire := make([]byte, 0, len(p)+len(eol))
 	wire = append(wire, p...)
 	wire = append(wire, eol...)
-	if _, err := h.port.Write(wire); err != nil {
+	port := h.curPort()
+	if _, err := port.Write(wire); err != nil {
 		// Surface to the visible sys pane (TUI) or stdout (headless) so the
 		// user sees it. Do NOT exit the UI: the port may recover (USB
 		// reconnect), or the user may want to inspect the prior session
 		// state before quitting manually.
 		h.st.sysMsg(fmt.Sprintf("[tx] %v", err))
+		// A dead device never recovers on the same fd (#1409): hand it to
+		// the headless reopen path instead of logging forever.
+		if isPortGone(err) {
+			h.txPortGone(port, err)
+		}
 		return false
 	}
 	h.st.recordTx(p, eol)
@@ -662,7 +873,7 @@ func (h *stdinHandler) startBench(duration time.Duration, chunkSize int) {
 				buf[i] = byte(seq & 0xff)
 				seq++
 			}
-			n, err := h.port.Write(buf)
+			n, err := h.curPort().Write(buf)
 			if err != nil {
 				h.st.sysMsg(fmt.Sprintf("--- bench: tx error: %v ---", err))
 				h.st.benchTxActive.Store(false)
@@ -730,6 +941,16 @@ flags:
   --ts            start stdout with HH:MM:SS.mmm prefix on each line
   --tx-eol E      append to each TX line: none | cr | lf | crlf (default lf)
   --list-ports    list detected serial ports and exit
+  --reopen-timeout D
+                  headless only: when the port goes away (read error, EOF,
+                  or a tx "device not configured"), retry opening it every
+                  500ms for up to D (default 30s, 0 = do not reopen). The
+                  text log gets "port lost" / "port reopened" markers.
+
+exit status:
+  0  normal shutdown (/quit, SIGINT, SIGTERM)
+  2  bad flags, or the port / a log file could not be opened at start
+  3  headless: the port was lost and could not be reopened in time
 
 interactive commands on stdin (type then Enter):
   /hex /ascii /mixed     switch display mode
@@ -759,6 +980,7 @@ func main() {
 	ts := flag.Bool("ts", false, "")
 	txEOLStr := flag.String("tx-eol", "lf", "")
 	listOnly := flag.Bool("list-ports", false, "")
+	reopenTimeout := flag.Duration("reopen-timeout", 30*time.Second, "")
 	flag.Usage = usage
 	flag.Parse()
 
@@ -799,7 +1021,8 @@ func main() {
 		os.Exit(2)
 	}
 
-	p, err := serial.Open(portPath, &serial.Mode{BaudRate: *baud})
+	serialMode := &serial.Mode{BaudRate: *baud}
+	p, err := openPort(portPath, serialMode)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "open %s: %v\n", portPath, err)
 		// macOS FTDI driver occasionally wedges so that any tcsetattr() returns
@@ -810,7 +1033,7 @@ func main() {
 		}
 		os.Exit(2)
 	}
-	_ = p.SetReadTimeout(250 * time.Millisecond)
+	_ = p.SetReadTimeout(portReadTimeout)
 
 	var logF *os.File
 	if *logPath != "" {
@@ -858,27 +1081,25 @@ func main() {
 	}()
 
 	useUI := isTerminal(os.Stdin) && isTerminal(os.Stdout)
-	h := &stdinHandler{st: st, port: p, txEOL: txEOL, stop: stop}
+	h := &stdinHandler{st: st, port: p, txEOL: txEOL, stop: stop, reopenOnLoss: !useUI}
 
+	exitCode := 0
 	if useUI {
 		runUI(st, p, logF, h, stop, done, portPath, *baud, *logPath, *textLogPath)
+		safeClose(stop)
+		_ = p.Close()
+		<-done
 	} else {
 		fmt.Fprintf(os.Stdout, "serial-term: %s @ %d  mode=%s  tx-eol=%s  (/help for cmds)\n",
 			portPath, *baud, m, *txEOLStr)
-		go readerLoop(p, logF, st, func(e error) {
-			fmt.Fprintf(os.Stderr, "[reader] %v\n", e)
-		}, stop, done)
 		// The stdin loop runs off the main goroutine: a FIFO opened
 		// read-write (`0<>fifo`) never reaches EOF, so a Scan() blocked on it
 		// must not keep SIGTERM/SIGINT from reaching the shutdown below. Both
 		// the signal handler and /quit close stop; stdin EOF does not.
 		go h.run()
-		<-stop
+		exitCode = runHeadless(p, portPath, serialMode, st, logF, h, stop, *reopenTimeout)
+		safeClose(stop)
 	}
-
-	safeClose(stop)
-	_ = p.Close()
-	<-done
 	// Shutdown fsync — covers every buffered line written at high rate.
 	if logF != nil {
 		_ = logF.Sync()
@@ -894,6 +1115,10 @@ func main() {
 			st.bytesIn, st.bytesOut, st.linesOut)
 	}
 	st.mu.Unlock()
+	if exitCode != 0 {
+		// os.Exit skips the deferred Close calls; both logs were synced above.
+		os.Exit(exitCode)
+	}
 }
 
 // isTerminal uses a real isatty(3) ioctl, not just "is this a char device",
