@@ -165,7 +165,7 @@ func testSignalShutdown(t *testing.T, bin string, sig syscall.Signal) {
 	textLogPath := filepath.Join(t.TempDir(), "text.log")
 	rawLogPath := filepath.Join(t.TempDir(), "raw.log")
 	fifo := fifoRWStdin(t)
-	slavePath := openPty(t)
+	slavePath, _ := openPty(t)
 
 	cmd, out, errOut := startChild(t, bin, fifo, slavePath, textLogPath, rawLogPath)
 
@@ -212,7 +212,7 @@ func TestQuitStillExits(t *testing.T) {
 	textLogPath := filepath.Join(t.TempDir(), "text.log")
 	rawLogPath := filepath.Join(t.TempDir(), "raw.log")
 	fifo := fifoRWStdin(t)
-	slavePath := openPty(t)
+	slavePath, _ := openPty(t)
 
 	cmd, out, errOut := startChild(t, bin, fifo, slavePath, textLogPath, rawLogPath)
 	pollFileFor(t, textLogPath, "session start", 5*time.Second)
@@ -247,7 +247,7 @@ func TestStdinEOFDoesNotShutdown(t *testing.T) {
 		t.Skipf("pipe: %v", err)
 	}
 	t.Cleanup(func() { pr.Close(); pw.Close() })
-	slavePath := openPty(t)
+	slavePath, _ := openPty(t)
 
 	cmd, out, errOut := startChild(t, bin, pr, slavePath, textLogPath, rawLogPath)
 	pollFileFor(t, textLogPath, "session start", 5*time.Second)

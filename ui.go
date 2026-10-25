@@ -122,15 +122,26 @@ func runUI(st *state, port serial.Port, logF interface {
 	// Note: text-log session-start banner is already written by main.go when
 	// it opens textLogF — do not duplicate it here.
 
+	// Lines run on one worker goroutine, in order, not on the UI goroutine:
+	// sendRaw can hold a line for up to --rx-quiet-max, and a blocked UI
+	// loop stops draining draw updates, which then blocks the reader while
+	// it holds st.mu.
+	lines := make(chan string, 64)
+	go func() {
+		for text := range lines {
+			if h.handleLine(text) {
+				app.Stop()
+				return
+			}
+		}
+	}()
 	input.SetDoneFunc(func(key tcell.Key) {
 		if key != tcell.KeyEnter {
 			return
 		}
 		text := input.GetText()
 		input.SetText("")
-		if h.handleLine(text) {
-			app.Stop()
-		}
+		lines <- text
 	})
 
 	// Layout: status (1), main (flex), input (1)
