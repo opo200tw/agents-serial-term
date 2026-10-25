@@ -142,6 +142,10 @@ type state struct {
 	sink       lineSink
 	onChange   func() // called after mode/eol/ts change so UI can repaint status
 
+	// lastRx is the UnixNano time the reader last got bytes from the port
+	// (0 = never). sendRaw reads it to hold a line until RX is quiet.
+	lastRx atomic.Int64
+
 	// Bench state. benchRxActive gates handleRx: while true, RX bytes go
 	// to the sequence verifier instead of the UI render path. benchTxActive
 	// gates the TX goroutine. They flip at different times so that after
@@ -201,6 +205,15 @@ func (s *state) sysMsg(msg string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.writeSysLocked(msg)
+}
+
+// textLogMsg writes a system line to --text-log only, not to the console.
+func (s *state) textLogMsg(msg string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.textLog != nil {
+		fmt.Fprintln(s.textLog, time.Now().Format("2006-01-02 15:04:05.000 ")+msg)
+	}
 }
 
 // flushPartialLocked emits any pending ASCII partial line. Called under mu.
@@ -494,6 +507,7 @@ func readerLoop(p serial.Port, logF io.Writer, st *state, errSink func(error), s
 		if n == 0 {
 			continue
 		}
+		st.lastRx.Store(time.Now().UnixNano())
 		data := buf[:n]
 		if logF != nil {
 			_, _ = logF.Write(data)
@@ -640,6 +654,11 @@ type stdinHandler struct {
 	txEOL []byte
 	stop  chan struct{}
 
+	// rxQuiet / rxQuietMax: sendRaw holds a line until RX has been quiet for
+	// rxQuiet, but no longer than rxQuietMax (#1608). Either 0 = no hold.
+	rxQuiet    time.Duration
+	rxQuietMax time.Duration
+
 	// reopenOnLoss is true in headless mode, the only mode that reopens a
 	// lost port (runHeadless). Set before any goroutine reads it.
 	reopenOnLoss bool
@@ -729,9 +748,17 @@ func (h *stdinHandler) run() {
 	<-h.stop
 }
 
+// sohImmediate is the per-line bypass of the RX-quiet hold: a line whose
+// first byte is ASCII SOH (0x01) is sent at once, without the SOH. Scripts
+// that must hit a short device window (a boot prompt) use it; a person
+// typing never does.
+const sohImmediate = "\x01"
+
 func (h *stdinHandler) handleLine(line string) bool {
+	immediate := strings.HasPrefix(line, sohImmediate)
+	line = strings.TrimPrefix(line, sohImmediate)
 	if !strings.HasPrefix(line, "/") {
-		return h.sendPayload([]byte(line))
+		return h.sendPayload([]byte(line), immediate)
 	}
 	cmd, arg, _ := strings.Cut(strings.TrimPrefix(line, "/"), " ")
 	switch strings.ToLower(cmd) {
@@ -764,7 +791,7 @@ func (h *stdinHandler) handleLine(line string) bool {
 			h.st.sysMsg(fmt.Sprintf("--- bad hex: %v ---", err))
 			return false
 		}
-		return h.sendRaw(raw, nil)
+		return h.sendRaw(raw, nil, immediate)
 	case "bench":
 		// /bench [seconds] [chunk_bytes]
 		dur := 5.0
@@ -809,11 +836,13 @@ func (h *stdinHandler) handleLine(line string) bool {
 	return false
 }
 
-func (h *stdinHandler) sendPayload(p []byte) bool {
-	return h.sendRaw(p, h.txEOL)
+func (h *stdinHandler) sendPayload(p []byte, immediate bool) bool {
+	return h.sendRaw(p, h.txEOL, immediate)
 }
 
-func (h *stdinHandler) sendRaw(p, eol []byte) bool {
+// sendRaw writes p + eol to the port. Unless immediate, it first waits for
+// RX quiet (waitRxQuiet).
+func (h *stdinHandler) sendRaw(p, eol []byte, immediate bool) bool {
 	if h.st.benchRxActive.Load() || h.st.benchTxActive.Load() {
 		h.st.sysMsg("--- bench in progress; TX ignored (use /bench-stop to abort) ---")
 		return false
@@ -821,6 +850,15 @@ func (h *stdinHandler) sendRaw(p, eol []byte) bool {
 	wire := make([]byte, 0, len(p)+len(eol))
 	wire = append(wire, p...)
 	wire = append(wire, eol...)
+	if immediate {
+		h.st.textLogMsg("--- tx immediate (SOH) ---")
+	} else if waited, held, capped := h.waitRxQuiet(); capped {
+		h.st.textLogMsg(fmt.Sprintf("--- tx delayed %v: rx not quiet for %v, sent at --rx-quiet-max ---",
+			waited.Round(time.Millisecond), h.rxQuiet))
+	} else if held {
+		h.st.textLogMsg(fmt.Sprintf("--- tx delayed %v until rx quiet for %v ---",
+			waited.Round(time.Millisecond), h.rxQuiet))
+	}
 	port := h.curPort()
 	if _, err := port.Write(wire); err != nil {
 		// Surface to the visible sys pane (TUI) or stdout (headless) so the
@@ -837,6 +875,31 @@ func (h *stdinHandler) sendRaw(p, eol []byte) bool {
 	}
 	h.st.recordTx(p, eol)
 	return false
+}
+
+// waitRxQuiet blocks until no RX byte has arrived for h.rxQuiet, or until
+// h.rxQuietMax has passed (the device may log without pause). A line written
+// while the device is still sending a log line can be corrupted on the
+// device side (#1608), and only the host can avoid that overlap. held says
+// whether it waited at all, capped whether it gave up at rxQuietMax.
+func (h *stdinHandler) waitRxQuiet() (waited time.Duration, held, capped bool) {
+	if h.rxQuiet <= 0 || h.rxQuietMax <= 0 {
+		return 0, false, false
+	}
+	start := time.Now()
+	for {
+		now := time.Now()
+		quietFor := now.Sub(time.Unix(0, h.st.lastRx.Load()))
+		if quietFor >= h.rxQuiet {
+			return now.Sub(start), held, false
+		}
+		left := h.rxQuietMax - now.Sub(start)
+		if left <= 0 {
+			return now.Sub(start), true, true
+		}
+		held = true
+		time.Sleep(min(h.rxQuiet-quietFor, left))
+	}
 }
 
 // startBench spawns a loopback throughput run. TX goroutine writes a rolling
@@ -946,6 +1009,15 @@ flags:
                   or a tx "device not configured"), retry opening it every
                   500ms for up to D (default 30s, 0 = do not reopen). The
                   text log gets "port lost" / "port reopened" markers.
+  --rx-quiet D    hold each sent line (typed, piped, FIFO, /hex-send) until
+                  no byte has been received for D (default 50ms, 0 = send
+                  at once), so it does not overlap a device log line
+  --rx-quiet-max D
+                  send the held line anyway after D of waiting, for a device
+                  that logs without pause (default 1s, 0 = no hold). The
+                  text log records each hold and each time the cap is hit.
+                  A stdin line starting with SOH (0x01) is sent at once
+                  without the hold; the SOH is not sent.
 
 exit status:
   0  normal shutdown (/quit, SIGINT, SIGTERM)
@@ -981,6 +1053,8 @@ func main() {
 	txEOLStr := flag.String("tx-eol", "lf", "")
 	listOnly := flag.Bool("list-ports", false, "")
 	reopenTimeout := flag.Duration("reopen-timeout", 30*time.Second, "")
+	rxQuiet := flag.Duration("rx-quiet", 50*time.Millisecond, "")
+	rxQuietMax := flag.Duration("rx-quiet-max", time.Second, "")
 	flag.Usage = usage
 	flag.Parse()
 
@@ -1081,7 +1155,8 @@ func main() {
 	}()
 
 	useUI := isTerminal(os.Stdin) && isTerminal(os.Stdout)
-	h := &stdinHandler{st: st, port: p, txEOL: txEOL, stop: stop, reopenOnLoss: !useUI}
+	h := &stdinHandler{st: st, port: p, txEOL: txEOL, stop: stop, reopenOnLoss: !useUI,
+		rxQuiet: *rxQuiet, rxQuietMax: *rxQuietMax}
 
 	exitCode := 0
 	if useUI {
