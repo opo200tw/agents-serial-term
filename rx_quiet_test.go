@@ -4,7 +4,7 @@
 // device is still transmitting a log line can be corrupted on the device
 // side, and the device cannot prevent it. serial-term therefore holds each
 // line until RX has been quiet for --rx-quiet (default 50ms), and sends it
-// anyway after --rx-quiet-max (default 1s) of waiting.
+// anyway after --rx-quiet-max (default 500ms) of waiting.
 //
 // The pty master plays the device: the test writes an RX stream into it and
 // reads serial-term's TX back from it, time-stamping both sides.
@@ -176,8 +176,10 @@ func logTextLine(t *testing.T, path, substr string) {
 }
 
 // TestSendCapWhenRxNeverQuiet: a device that logs without a 50ms gap must
-// not hold a line forever; it goes out at about the 1s cap, and the text
-// log says the cap was hit.
+// not hold a line forever; it goes out at about the 500ms cap, and the text
+// log says the cap was hit. The cap must stay well under uart_cmd's 1000ms
+// idle clear: a typed line sent one char per send loses its first char when
+// the second one comes 1s later (UM-GPM7-camera #1957).
 func TestSendCapWhenRxNeverQuiet(t *testing.T) {
 	bin := buildBinary(t)
 	slave, master := openPty(t)
@@ -200,8 +202,8 @@ func TestSendCapWhenRxNeverQuiet(t *testing.T) {
 	if !rxStillActive {
 		t.Errorf("stream ended before the TX byte arrived; the cap was not exercised")
 	}
-	if delay < 900*time.Millisecond || delay > 1300*time.Millisecond {
-		t.Errorf("line went out %v after stdin, want about the 1s cap", delay)
+	if delay < 400*time.Millisecond || delay > 800*time.Millisecond {
+		t.Errorf("line went out %v after stdin, want about the 500ms cap", delay)
 	}
 	pollFileFor(t, textLog, "rx-quiet-max", 2*time.Second)
 	logTextLine(t, textLog, "rx-quiet-max")

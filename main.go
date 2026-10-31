@@ -1014,7 +1014,7 @@ flags:
                   at once), so it does not overlap a device log line
   --rx-quiet-max D
                   send the held line anyway after D of waiting, for a device
-                  that logs without pause (default 1s, 0 = no hold). The
+                  that logs without pause (default 500ms, 0 = no hold). The
                   text log records each hold and each time the cap is hit.
                   A stdin line starting with SOH (0x01) is sent at once
                   without the hold; the SOH is not sent.
@@ -1054,7 +1054,8 @@ func main() {
 	listOnly := flag.Bool("list-ports", false, "")
 	reopenTimeout := flag.Duration("reopen-timeout", 30*time.Second, "")
 	rxQuiet := flag.Duration("rx-quiet", 50*time.Millisecond, "")
-	rxQuietMax := flag.Duration("rx-quiet-max", time.Second, "")
+	// Well under the firmware's 1000ms uart_cmd idle clear (UM-GPM7-camera #1957)
+	rxQuietMax := flag.Duration("rx-quiet-max", 500*time.Millisecond, "")
 	flag.Usage = usage
 	flag.Parse()
 
