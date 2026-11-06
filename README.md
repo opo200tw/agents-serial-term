@@ -221,6 +221,10 @@ PORT:
   If omitted the tool lists all detected ports and prompts you to pick one
   (uses go.bug.st/serial's GetPortsList — covers everything the OS reports).
   --list-ports just prints the list and exits.
+
+--version prints "serial-term <commit> <commit time>" from the git info
+`go build` stamps in (+dirty when built with uncommitted changes); a binary
+built outside a git checkout prints "unknown".
 ```
 
 ## Interactive session example
