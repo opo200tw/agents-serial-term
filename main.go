@@ -23,6 +23,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -1004,6 +1005,7 @@ flags:
   --ts            start stdout with HH:MM:SS.mmm prefix on each line
   --tx-eol E      append to each TX line: none | cr | lf | crlf (default lf)
   --list-ports    list detected serial ports and exit
+  --version       print the git commit the binary was built from and exit
   --reopen-timeout D
                   headless only: when the port goes away (read error, EOF,
                   or a tx "device not configured"), retry opening it every
@@ -1058,12 +1060,18 @@ func main() {
 	ts := flag.Bool("ts", false, "")
 	txEOLStr := flag.String("tx-eol", "lf", "")
 	listOnly := flag.Bool("list-ports", false, "")
+	showVersion := flag.Bool("version", false, "")
 	reopenTimeout := flag.Duration("reopen-timeout", 30*time.Second, "")
 	rxQuiet := flag.Duration("rx-quiet", 50*time.Millisecond, "")
 	// Well under the firmware's 1000ms uart_cmd idle clear (UM-GPM7-camera #1957)
 	rxQuietMax := flag.Duration("rx-quiet-max", 500*time.Millisecond, "")
 	flag.Usage = usage
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println(version())
+		return
+	}
 
 	if *listOnly {
 		ports, err := listPorts()
@@ -1221,6 +1229,36 @@ func main() {
 // fails ("device not configured") when the process has no controlling tty.
 func isTerminal(f *os.File) bool {
 	return term.IsTerminal(int(f.Fd()))
+}
+
+// version reports the commit `go build` stamped into the binary
+// ("serial-term <rev12> <commit time>", "+dirty" for uncommitted changes).
+// ponytail: no hand-kept version number; the commit is what callers compare.
+func version() string {
+	bi, ok := debug.ReadBuildInfo()
+	if !ok {
+		return "serial-term unknown"
+	}
+	var rev, at, dirty string
+	for _, s := range bi.Settings {
+		switch s.Key {
+		case "vcs.revision":
+			rev = s.Value
+		case "vcs.time":
+			at = s.Value
+		case "vcs.modified":
+			if s.Value == "true" {
+				dirty = "+dirty"
+			}
+		}
+	}
+	if rev == "" {
+		return "serial-term unknown (built without git info)"
+	}
+	if len(rev) > 12 {
+		rev = rev[:12]
+	}
+	return fmt.Sprintf("serial-term %s%s %s", rev, dirty, at)
 }
 
 func safeClose(ch chan struct{}) {
