@@ -142,6 +142,7 @@ type state struct {
 	textLog    *os.File // mirrors every rendered line, includes timestamp
 	sink       lineSink
 	onChange   func() // called after mode/eol/ts change so UI can repaint status
+	baud       int    // sizes the RX replay guard (replayGuardBaud), 0 = guard off
 
 	// lastRx is the UnixNano time the reader last got bytes from the port
 	// (0 = never). sendRaw reads it to hold a line until RX is quiet.
@@ -483,6 +484,14 @@ func readerLoop(p serial.Port, logF io.Writer, st *state, errSink func(error), s
 			st.sysMsg("--- bench aborted: reader exited (port gone?) ---")
 		}
 	}()
+	guard := newReplayGuard(st.baud) // fresh per open: history never spans a reopen
+	defer func() {
+		if guard != nil {
+			if note := guard.endEpisode(guardNow()); note != "" {
+				st.portEvent(note)
+			}
+		}
+	}()
 	buf := make([]byte, 1024)
 	for {
 		select {
@@ -508,8 +517,17 @@ func readerLoop(p serial.Port, logF io.Writer, st *state, errSink func(error), s
 		if n == 0 {
 			continue
 		}
-		st.lastRx.Store(time.Now().UnixNano())
 		data := buf[:n]
+		if guard != nil {
+			drop, note := guard.check(data)
+			if note != "" {
+				st.portEvent(note)
+			}
+			if drop {
+				continue
+			}
+		}
+		st.lastRx.Store(time.Now().UnixNano())
 		if logF != nil {
 			_, _ = logF.Write(data)
 			// No Sync here — main() syncs on shutdown.
@@ -1172,6 +1190,7 @@ func main() {
 
 	st := &state{
 		mode:    m,
+		baud:    replayGuardBaud(portPath, *baud),
 		showTS:  *ts,
 		textLog: textLogF,
 		sink:    lineSink{rxOut: os.Stdout, txOut: os.Stdout, sysOut: os.Stdout},
