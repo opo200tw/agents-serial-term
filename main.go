@@ -521,7 +521,19 @@ func readerLoop(p serial.Port, logF io.Writer, st *state, errSink func(error), s
 // openPort is serial.Open behind a package var so tests can stand in a fake
 // port for the open and every reopen.
 var openPort = func(path string, mode *serial.Mode) (serial.Port, error) {
-	return serial.Open(path, mode)
+	return openAndFlush(serial.Open, path, mode)
+}
+
+// openAndFlush opens the port and drops input the driver buffered before the
+// open, so a capture starts with fresh device output.
+func openAndFlush(open func(string, *serial.Mode) (serial.Port, error), path string, mode *serial.Mode) (serial.Port, error) {
+	p, err := open(path, mode)
+	if err != nil {
+		return nil, err
+	}
+	// Error ignored: a port that cannot flush still works; stale bytes are the lesser harm (#8).
+	_ = p.ResetInputBuffer()
+	return p, nil
 }
 
 // portReadTimeout bounds each Read so readerLoop can notice stop.
