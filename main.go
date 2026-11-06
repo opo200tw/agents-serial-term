@@ -1024,6 +1024,12 @@ exit status:
   2  bad flags, or the port / a log file could not be opened at start
   3  headless: the port was lost and could not be reopened in time
 
+busy port:
+  When another serial-term holds PORT, the open fails as before (status 2)
+  but names the holder's pid and --text-log. Run from a terminal, it instead
+  prints the last lines of that log and follows it until Ctrl-C or the holder
+  exits (status 0). Nothing is sent to the device.
+
 interactive commands on stdin (type then Enter):
   /hex /ascii /mixed     switch display mode
   /ts                    toggle timestamps
@@ -1106,6 +1112,14 @@ func main() {
 		if runtime.GOOS == "darwin" && strings.Contains(err.Error(), "invalid argument") {
 			fmt.Fprintln(os.Stderr, "hint: macOS FTDI driver appears wedged — replug the USB cable to recover.")
 		}
+		if isPortBusy(err) {
+			stop := make(chan struct{})
+			sig := make(chan os.Signal, 1)
+			signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+			go func() { <-sig; safeClose(stop) }()
+			follow := isTerminal(os.Stdin) && isTerminal(os.Stdout)
+			os.Exit(reportBusy(portPath, follow, os.Stdout, os.Stderr, stop))
+		}
 		os.Exit(2)
 	}
 	_ = p.SetReadTimeout(portReadTimeout)
@@ -1132,6 +1146,9 @@ func main() {
 			time.Now().Format("2006-01-02 15:04:05.000"), portPath, *baud, m, *txEOLStr)
 		_ = textLogF.Sync()
 	}
+
+	// Lets a second serial-term on this port show our --text-log (holder.go).
+	unpublish := publishHolder(portPath, *textLogPath)
 
 	st := &state{
 		mode:    m,
@@ -1191,6 +1208,7 @@ func main() {
 			st.bytesIn, st.bytesOut, st.linesOut)
 	}
 	st.mu.Unlock()
+	unpublish()
 	if exitCode != 0 {
 		// os.Exit skips the deferred Close calls; both logs were synced above.
 		os.Exit(exitCode)
