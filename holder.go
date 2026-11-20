@@ -67,22 +67,11 @@ func publishHolder(port, textLog string) func() {
 	if runtime.GOOS == "windows" {
 		return func() {}
 	}
-	if textLog != "" {
-		if abs, err := filepath.Abs(textLog); err == nil {
-			textLog = abs
-		}
-	}
 	path := holderFile(port)
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return func() {}
 	}
-	tmp := fmt.Sprintf("%s.%d.tmp", path, os.Getpid())
-	body := fmt.Sprintf("pid=%d\ntext-log=%s\n", os.Getpid(), textLog)
-	if err := os.WriteFile(tmp, []byte(body), 0o600); err != nil {
-		return func() {}
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
+	if writeHolder(path, textLog, "") != nil {
 		return func() {}
 	}
 	return func() {
@@ -90,6 +79,41 @@ func publishHolder(port, textLog string) func() {
 			_ = os.Remove(path)
 		}
 	}
+}
+
+// writeHolder atomically replaces the record at path with this pid, the
+// absolute textLog and extra (key=value lines).
+func writeHolder(path, textLog, extra string) error {
+	if textLog != "" {
+		if abs, err := filepath.Abs(textLog); err == nil {
+			textLog = abs
+		}
+	}
+	tmp := fmt.Sprintf("%s.%d.tmp", path, os.Getpid())
+	body := fmt.Sprintf("pid=%d\ntext-log=%s\n%s", os.Getpid(), textLog, extra)
+	if err := os.WriteFile(tmp, []byte(body), 0o600); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
+}
+
+// refreshHolder rewrites this process's record with the heartbeat fields
+// in extra. It never creates a record, and leaves one that names another
+// pid alone: that process took the port while this one waited to reopen.
+// The check-then-rename window is a few microseconds once a second.
+func refreshHolder(port, textLog, extra string) {
+	if runtime.GOOS == "windows" {
+		return
+	}
+	path := holderFile(port)
+	if h, err := parseHolder(path); err != nil || h.pid != os.Getpid() {
+		return
+	}
+	_ = writeHolder(path, textLog, extra)
 }
 
 func parseHolder(path string) (holderInfo, error) {
