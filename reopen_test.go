@@ -119,6 +119,13 @@ type headlessRig struct {
 
 func startHeadless(t *testing.T, p serial.Port, reopenTimeout time.Duration, open func(string, *serial.Mode) (serial.Port, error)) *headlessRig {
 	t.Helper()
+	return startHeadlessWatched(t, p, reopenTimeout, open, 0, nil)
+}
+
+// startHeadlessWatched is startHeadless with the watchdog on (watch > 0)
+// and a heartbeat sink (nil = none).
+func startHeadlessWatched(t *testing.T, p serial.Port, reopenTimeout time.Duration, open func(string, *serial.Mode) (serial.Port, error), watch time.Duration, beat func(st *state, node string)) *headlessRig {
+	t.Helper()
 	oldOpen, oldInterval := openPort, reopenRetryInterval
 	openPort = open
 	reopenRetryInterval = 20 * time.Millisecond
@@ -140,10 +147,24 @@ func startHeadless(t *testing.T, p serial.Port, reopenTimeout time.Duration, ope
 	stop := make(chan struct{})
 	h := &stdinHandler{st: st, port: p, txEOL: []byte{'\n'}, stop: stop, reopenOnLoss: true}
 	r := &headlessRig{st: st, h: h, stop: stop, logPath: logPath, stdout: out, result: make(chan int, 1)}
+	var beatFn func(string)
+	if beat != nil {
+		beatFn = func(node string) { beat(st, node) }
+	}
+	finished := make(chan struct{})
 	go func() {
-		r.result <- runHeadless(p, "/dev/fake", &serial.Mode{BaudRate: 115200}, st, nil, h, stop, reopenTimeout)
+		defer close(finished)
+		r.result <- runHeadless(p, "/dev/fake", &serial.Mode{BaudRate: 115200}, st, nil, h, stop, reopenTimeout, watch, beatFn)
 	}()
-	t.Cleanup(func() { safeClose(stop) })
+	// Wait for the run to end so no goroutine of it still reads the
+	// package vars the next cleanups restore.
+	t.Cleanup(func() {
+		safeClose(stop)
+		select {
+		case <-finished:
+		case <-time.After(3 * time.Second):
+		}
+	})
 	return r
 }
 

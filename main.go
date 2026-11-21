@@ -147,6 +147,11 @@ type state struct {
 	// lastRx is the UnixNano time the reader last got bytes from the port
 	// (0 = never). sendRaw reads it to hold a line until RX is quiet.
 	lastRx atomic.Int64
+	// lastPoll is the monoNow() time a port Read last returned, data or
+	// not, and rxBytes counts the bytes kept after the replay guard. The
+	// headless watchdog and heartbeat read both without taking mu.
+	lastPoll atomic.Int64
+	rxBytes  atomic.Uint64
 
 	// Bench state. benchRxActive gates handleRx: while true, RX bytes go
 	// to the sequence verifier instead of the UI render path. benchTxActive
@@ -500,6 +505,7 @@ func readerLoop(p serial.Port, logF io.Writer, st *state, errSink func(error), s
 		default:
 		}
 		n, err := p.Read(buf)
+		st.lastPoll.Store(monoNow())
 		if err != nil {
 			select {
 			case <-stop:
@@ -528,6 +534,7 @@ func readerLoop(p serial.Port, logF io.Writer, st *state, errSink func(error), s
 			}
 		}
 		st.lastRx.Store(time.Now().UnixNano())
+		st.rxBytes.Add(uint64(n))
 		if logF != nil {
 			_, _ = logF.Write(data)
 			// No Sync here — main() syncs on shutdown.
@@ -590,13 +597,29 @@ func (s *state) portEvent(msg string) {
 // is a loss: mark it in the log, close the port, reopen it with the same
 // mode for up to reopenTimeout, and carry on with a new reader.
 //
+// While a port is open, watchReader (watchdog.go) checks the reader and the
+// PORT node every watchdogTick and writes the heartbeat (beat, may be nil);
+// watch 0 turns its checks off.
+//
 // Returns 0 when stop closed, exitPortLost when the reopen gave up. The port
-// is closed and the reader has exited on return either way.
-func runHeadless(p serial.Port, path string, sm *serial.Mode, st *state, logW io.Writer, h *stdinHandler, stop chan struct{}, reopenTimeout time.Duration) int {
+// is closed and the reader has exited on return either way, except for
+// exitStalled: the watchdog found a reader that would not stop, and the
+// caller must exit without waiting for it.
+func runHeadless(p serial.Port, path string, sm *serial.Mode, st *state, logW io.Writer, h *stdinHandler, stop chan struct{}, reopenTimeout, watch time.Duration, beat func(node string)) int {
 	for {
 		done := make(chan struct{})
 		var mu sync.Mutex
 		var readErr error
+		opened := time.Now()
+		st.lastPoll.Store(monoNow())
+		id, idErr := statPort(path)
+		wedged, wdDone := make(chan struct{}), make(chan struct{})
+		go func(p serial.Port) {
+			defer close(wdDone)
+			if watchReader(p, path, id, idErr == nil, opened, st, h, watch, beat, done, stop) {
+				close(wedged)
+			}
+		}(p)
 		go readerLoop(p, logW, st, func(e error) {
 			fmt.Fprintf(os.Stderr, "[reader] %v\n", e)
 			mu.Lock()
@@ -608,9 +631,13 @@ func runHeadless(p serial.Port, path string, sm *serial.Mode, st *state, logW io
 		case <-stop:
 			_ = p.Close()
 			<-done
+			<-wdDone
 			return 0
+		case <-wedged:
+			return exitStalled
 		case <-done:
 		}
+		<-wdDone // returns on done; one watchdog per open
 		// readerLoop also returns on stop; that is a shutdown, not a loss.
 		select {
 		case <-stop:
@@ -619,9 +646,10 @@ func runHeadless(p serial.Port, path string, sm *serial.Mode, st *state, logW io
 		default:
 		}
 
-		// A tx-side loss closed the port to end the reader, so the read
-		// error is only "port closed"; the tx error is the real reason.
-		cause := h.takeTxLoss()
+		// A tx-side or watchdog loss closed the port to end the reader, so
+		// the read error is only "port closed"; the recorded one is the
+		// real reason.
+		cause := h.takeLoss()
 		if cause == nil {
 			mu.Lock()
 			cause = readErr
@@ -694,11 +722,11 @@ type stdinHandler struct {
 	// lost port (runHeadless). Set before any goroutine reads it.
 	reopenOnLoss bool
 
-	// portMu guards port and txLossErr: headless mode swaps the port after a
+	// portMu guards port and lossErr: headless mode swaps the port after a
 	// reopen while sendRaw and the bench TX goroutine keep writing to it.
-	portMu    sync.Mutex
-	port      serial.Port
-	txLossErr error // tx error that made us close port; read by the reopen path
+	portMu  sync.Mutex
+	port    serial.Port
+	lossErr error // tx or watchdog reason we closed port; read by the reopen path
 }
 
 // curPort returns the port TX must use right now.
@@ -714,17 +742,31 @@ func (h *stdinHandler) setPort(p serial.Port) {
 	h.portMu.Lock()
 	defer h.portMu.Unlock()
 	h.port = p
-	h.txLossErr = nil
+	h.lossErr = nil
 }
 
-// takeTxLoss returns and clears the tx error that closed the current port,
-// or nil if the port went away on the RX side.
-func (h *stdinHandler) takeTxLoss() error {
+// takeLoss returns and clears the reason recorded for closing the current
+// port, or nil if the port went away on the RX side.
+func (h *stdinHandler) takeLoss() error {
 	h.portMu.Lock()
 	defer h.portMu.Unlock()
-	err := h.txLossErr
-	h.txLossErr = nil
+	err := h.lossErr
+	h.lossErr = nil
 	return err
+}
+
+// recordLoss keeps err as the reason p is being closed, unless p was
+// already replaced (false) or a reason is already recorded.
+func (h *stdinHandler) recordLoss(p serial.Port, err error) bool {
+	h.portMu.Lock()
+	defer h.portMu.Unlock()
+	if h.port != p {
+		return false
+	}
+	if h.lossErr == nil {
+		h.lossErr = err
+	}
+	return true
 }
 
 // txPortGone handles a write that failed because the device is gone. It
@@ -737,16 +779,9 @@ func (h *stdinHandler) txPortGone(p serial.Port, err error) {
 	if !h.reopenOnLoss {
 		return
 	}
-	h.portMu.Lock()
-	if h.port != p {
-		h.portMu.Unlock()
-		return
+	if h.recordLoss(p, err) {
+		_ = p.Close()
 	}
-	if h.txLossErr == nil {
-		h.txLossErr = err
-	}
-	h.portMu.Unlock()
-	_ = p.Close()
 }
 
 // isPortGone reports whether err means the device node is dead (USB-UART
@@ -1041,6 +1076,15 @@ flags:
                   or a tx "device not configured"), retry opening it every
                   500ms for up to D (default 30s, 0 = do not reopen). The
                   text log gets "port lost" / "port reopened" markers.
+  --watchdog D    headless only: once a second, check that a port read
+                  returned within D and that PORT is still the node that
+                  was opened. A reader stuck for D, or PORT gone or
+                  replaced with no RX for D, gets a "--- watchdog: ..."
+                  line and is handled as a lost port (reopen); a reader
+                  that will not stop exits 4. A quiet port on the same
+                  node is left alone. Also writes the heartbeat (see
+                  below). Default 10s, 0 = no checks, else at least 1s
+                  (a healthy read returns every 250ms).
   --rx-quiet D    hold each sent line (typed, piped, FIFO, /hex-send) until
                   no byte has been received for D (default 50ms, 0 = send
                   at once), so it does not overlap a device log line
@@ -1055,6 +1099,15 @@ exit status:
   0  normal shutdown (/quit, SIGINT, SIGTERM)
   2  bad flags, or the port / a log file could not be opened at start
   3  headless: the port was lost and could not be reopened in time
+  4  headless: the watchdog found a reader that would not stop
+
+heartbeat (headless, not Windows):
+  Once a second the holder file /tmp/serial-term-<uid>/<PORT basename>.holder
+  gets heartbeat=, last-poll= and last-rx= (Unix ms; last-rx=0: nothing
+  received yet), rx-bytes= and node=ok|gone|replaced (unknown when PORT
+  could not be stat'ed at open). A stale heartbeat outside a reopen
+  wait means the process is stuck; a fresh one with an old last-rx means
+  serial-term is reading and nothing arrives.
 
 busy port:
   When another serial-term holds PORT, the open fails as before (status 2)
@@ -1092,6 +1145,7 @@ func main() {
 	listOnly := flag.Bool("list-ports", false, "")
 	showVersion := flag.Bool("version", false, "")
 	reopenTimeout := flag.Duration("reopen-timeout", 30*time.Second, "")
+	watch := flag.Duration("watchdog", 10*time.Second, "")
 	rxQuiet := flag.Duration("rx-quiet", 50*time.Millisecond, "")
 	// Well under the firmware's 1000ms uart_cmd idle clear (UM-GPM7-camera #1957)
 	rxQuietMax := flag.Duration("rx-quiet-max", 500*time.Millisecond, "")
@@ -1137,6 +1191,10 @@ func main() {
 	txEOL, err := parseEOL(*txEOLStr)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
+	if *watch != 0 && *watch < time.Second {
+		fmt.Fprintf(os.Stderr, "--watchdog %v: use 0 (off) or at least 1s\n", *watch)
 		os.Exit(2)
 	}
 
@@ -1229,8 +1287,21 @@ func main() {
 		// must not keep SIGTERM/SIGINT from reaching the shutdown below. Both
 		// the signal handler and /quit close stop; stdin EOF does not.
 		go h.run()
-		exitCode = runHeadless(p, portPath, serialMode, st, logF, h, stop, *reopenTimeout)
+		beat := func(node string) { refreshHolder(portPath, *textLogPath, heartbeatFields(st, node)) }
+		exitCode = runHeadless(p, portPath, serialMode, st, logF, h, stop, *reopenTimeout, *watch, beat)
 		safeClose(stop)
+	}
+	if exitCode == exitStalled {
+		// The reader may hold st.mu forever: sync, unpublish and go,
+		// without the final stats below.
+		if logF != nil {
+			_ = logF.Sync()
+		}
+		if textLogF != nil {
+			_ = textLogF.Sync()
+		}
+		unpublish()
+		os.Exit(exitStalled)
 	}
 	// Shutdown fsync — covers every buffered line written at high rate.
 	if logF != nil {
